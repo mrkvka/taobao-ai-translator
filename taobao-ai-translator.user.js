@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.5.0
+// @version      1.5.1
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @updateURL    https://raw.githubusercontent.com/mrkvka/taobao-ai-translator/main/taobao-ai-translator.user.js
@@ -220,8 +220,10 @@
   const GOOGLE_PARALLEL = 10;
   const AI_CHUNK = 100;
   const AI_PARALLEL = 3;
+  const PRICE_QUERY =
+    '[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"], [class*="realPrice"], [class*="RealPrice"], [class*="salePrice"], [class*="SalePrice"], [class*="innerPrice"], [class*="InnerPrice"]';
   const PRICE_SEL =
-    '[class*="price" i],[class*="Price"],[class*="amount" i],[class*="Amount"],[class*="money" i],[class*="Money"],[class*="total" i],[class*="Total"],[class*="fee" i],[class*="Fee"],[class*="rmb" i],[class*="RMB"],[class*="currency" i],[class*="Currency"]';
+    PRICE_QUERY + ',[class*="amount" i],[class*="Amount"],[class*="currency" i],[class*="Currency"]';
   const BLOCK_SEL =
     'h1,h2,h3,h4,li,tr,td,th,article,section,[class*="title"],[class*="Title"],[class*="desc"],[class*="Desc"],[class*="spec"],[class*="Spec"],[class*="attr"],[class*="sku"],[class*="param"],[class*="review"],[class*="Review"],[class*="item"],[class*="Item"]';
 
@@ -513,8 +515,33 @@
   }
 
   function isYuanOnlyText(text) {
-    const t = String(text || '').trim();
-    return !t || /^[¥￥\u00a5\uffe5]$/.test(t) || /^[¥￥\u00a5\uffe5]\s*$/.test(t) || t === '元';
+    const t = String(text || '').replace(/\s/g, '');
+    return !t || /^[¥￥\u00a5\uffe5元]+$/.test(t);
+  }
+
+  function hideYuanEl(el) {
+    el.style.cssText =
+      'display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important;margin:0!important;padding:0!important';
+    el.dataset.tbPriceHide = '1';
+  }
+
+  function hideAllYuanInRow(row) {
+    if (!row) return;
+    row.dataset.tbPriceRoot = '1';
+    row.querySelectorAll('span, em, i, b, s, div').forEach((s) => {
+      if (s.dataset.tbPrice) return;
+      if (isYuanOnlyText(s.textContent)) hideYuanEl(s);
+    });
+    let p = row.parentElement;
+    for (let i = 0; i < 3 && p; i++) {
+      if (!p.closest(PRICE_SEL)) break;
+      p.dataset.tbPriceRoot = '1';
+      p.querySelectorAll('span, em, i, b, s').forEach((s) => {
+        if (s.dataset.tbPrice || !isYuanOnlyText(s.textContent)) return;
+        if (/₽/.test(p.innerText || '')) hideYuanEl(s);
+      });
+      p = p.parentElement;
+    }
   }
 
   function findPriceRow(el) {
@@ -530,25 +557,6 @@
       node = node.parentElement;
     }
     return el.parentElement || el;
-  }
-
-  function hideAllYuanInRow(row) {
-    if (!row) return;
-    row.dataset.tbPriceRoot = '1';
-    row.querySelectorAll('span, em, i, b, s, div').forEach((s) => {
-      if (s.dataset.tbPrice) return;
-      const t = (s.textContent || '').trim();
-      if (isYuanOnlyText(t)) {
-        s.style.cssText =
-          'display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important;margin:0!important;padding:0!important';
-        s.dataset.tbPriceHide = '1';
-      }
-    });
-  }
-
-  function hideYuanSymbol(root) {
-    hideAllYuanInRow(findPriceRow(root));
-    hideAllYuanInRow(root);
   }
 
   function markPrice(el, orig) {
@@ -605,7 +613,15 @@
       }
 
       const raw = (el.innerText || el.textContent || '').trim();
-      if (!raw || /₽/.test(raw)) return false;
+      if (!raw) return false;
+
+      if (/₽/.test(raw)) {
+        if (/[¥￥\u00a5\uffe5]/.test(raw)) {
+          el.textContent = raw.replace(/[¥￥\u00a5\uffe5]\s*/g, '').trim();
+        }
+        hideAllYuanInRow(findPriceRow(el));
+        return true;
+      }
 
       if (isPurePriceText(raw)) {
         const cny = extractCny(raw);
@@ -620,7 +636,7 @@
         if (next && next !== raw) {
           markPrice(el, raw);
           el.textContent = next;
-          hideYuanSymbol(el);
+          hideAllYuanInRow(findPriceRow(el));
           return true;
         }
       }
@@ -633,9 +649,17 @@
 
   function replacePriceContainer(el, cny, orig, rate) {
     const row = findPriceRow(el);
+    const rub = formatRub(cny, rate);
     hideAllYuanInRow(row);
-    markPrice(el, orig);
-    el.textContent = formatRub(cny, rate);
+    const rowText = (row.innerText || '').replace(/\s+/g, ' ').trim();
+    const extra = rowText.replace(/^[¥￥\u00a5\uffe5\d\s.,]+/i, '').replace(/[\d\s.,]+ ₽/i, '').trim();
+    if (!extra || extra.length <= 4) {
+      markPrice(row, orig);
+      row.textContent = rub;
+    } else {
+      markPrice(el, orig);
+      el.textContent = rub;
+    }
     hideAllYuanInRow(row);
   }
 
@@ -697,31 +721,57 @@
 
   function collectPriceContainers(root = document.body) {
     const set = new Set();
-    root.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((el) => {
+    root.querySelectorAll(PRICE_QUERY).forEach((el) => {
       if (isOurNode(el)) return;
+      set.add(el);
       if (isDigitSplitContainer(el) || isPurePriceText((el.innerText || '').trim())) set.add(el);
       el.querySelectorAll('span, em, b, i').forEach((c) => {
-        if (isDigitSplitContainer(c) || isPurePriceText((c.textContent || '').trim())) set.add(c);
+        const t = (c.textContent || '').trim();
+        if (isDigitSplitContainer(c) || isPurePriceText(t) || (/^[¥￥\u00a5\uffe5]?\s*\d/.test(t) && !/₽/.test(t)))
+          set.add(c);
       });
     });
     return [...set].filter((el) => isVisible(el) && !el.closest('[data-tb-price]'));
   }
 
+  function scrubYuanLeftovers(root = document.body) {
+    root.querySelectorAll(PRICE_QUERY).forEach((block) => {
+      if (/₽/.test(block.innerText || '')) {
+        block.dataset.tbPriceRoot = '1';
+        hideAllYuanInRow(block);
+      }
+    });
+    root.querySelectorAll('span, em, b, i, s').forEach((el) => {
+      if (isOurNode(el) || el.children.length > 0) return;
+      const t = (el.textContent || '').trim();
+      if (/[¥￥\u00a5\uffe5]/.test(t) && /₽/.test(t)) {
+        el.textContent = t.replace(/[¥￥\u00a5\uffe5]\s*/g, '').trim();
+        el.dataset.tbPrice = '1';
+      } else if (isYuanOnlyText(t)) {
+        let p = el.parentElement;
+        for (let i = 0; i < 5 && p; i++) {
+          if (/₽/.test(p.innerText || '')) {
+            hideYuanEl(el);
+            p.dataset.tbPriceRoot = '1';
+            break;
+          }
+          p = p.parentElement;
+        }
+      }
+    });
+  }
+
   function fixBrokenRubPrices(root = document.body) {
-    root.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((block) => {
+    scrubYuanLeftovers(root);
+    root.querySelectorAll(PRICE_QUERY).forEach((block) => {
       block.querySelectorAll('span, em, b, i').forEach((el) => {
         if (el.children.length > 0) return;
-        let t = (el.textContent || '').trim();
+        const t = (el.textContent || '').trim();
         const both = t.match(/^([¥￥\u00a5\uffe5]\s*)?([\d\s.,]+ ₽)(.*)$/);
         if (both) {
           el.textContent = both[2] + both[3];
           el.dataset.tbPrice = '1';
           hideAllYuanInRow(el.parentElement);
-          return;
-        }
-        if (isYuanOnlyText(t) && /₽/.test(block.innerText || '')) {
-          el.style.cssText = 'display:none!important;width:0!important;height:0!important;font-size:0!important';
-          el.dataset.tbPriceHide = '1';
         }
       });
     });
@@ -736,6 +786,7 @@
       fixBrokenRubPrices(root);
       const rate = await getCnyRubRate();
       for (const el of collectPriceContainers(root)) applyPriceContainer(el, rate);
+      scrubYuanLeftovers(root);
     } finally {
       done();
       priceBusy = false;
