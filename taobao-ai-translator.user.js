@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.3.2
+// @version      1.3.3
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @match        https://*.taobao.com/*
 // @match        https://*.tmall.com/*
 // @match        https://taobao.com/*
 // @match        https://tmall.com/*
+// @match        https://login.taobao.com/*
+// @match        https://www.taobao.com/*
+// @match        http://*.taobao.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -286,23 +289,52 @@
     const st = document.createElement('style');
     st.id = 'tb-price-css';
     st.textContent =
-      '[data-tb-price-hide]{display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important}' +
-      '[data-tb-price-root]::before,[data-tb-price-root]::after{content:none!important;display:none!important}' +
-      '[class*="Price--symbol"],[class*="price--symbol"],[class*="currency--"],[class*="Unit--"],[class*="unit--"]{display:none!important}';
+      '[data-tb-price-hide]{display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important;margin:0!important;padding:0!important;border:0!important}' +
+      '[data-tb-price-root]::before,[data-tb-price-root]::after{content:none!important;display:none!important;width:0!important;height:0!important}' +
+      '[data-tb-price-root] [class*="symbol"],[data-tb-price-root] [class*="Symbol"],' +
+      '[data-tb-price-root] [class*="currency"],[data-tb-price-root] [class*="Currency"],' +
+      '[data-tb-price-root] [class*="unit"],[data-tb-price-root] [class*="Unit"],' +
+      '[class*="Price--symbol"],[class*="price--symbol"],[class*="currency--"],[class*="Unit--"],[class*="unit--"]{display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important}';
     document.head.appendChild(st);
   }
 
-  function hideYuanSymbol(root) {
-    if (!root) return;
-    root.dataset.tbPriceRoot = '1';
-    root.querySelectorAll('span, em, i, b, div').forEach((s) => {
-      if (s.dataset.tbPriceHide) return;
+  function isYuanOnlyText(text) {
+    const t = String(text || '').trim();
+    return !t || /^[¥￥\u00a5\uffe5]$/.test(t) || /^[¥￥\u00a5\uffe5]\s*$/.test(t) || t === '元';
+  }
+
+  function findPriceRow(el) {
+    let node = el;
+    for (let i = 0; i < 5 && node; i++) {
+      const t = (node.innerText || '').trim();
+      if (!t || t.length > 80) {
+        node = node.parentElement;
+        continue;
+      }
+      if (extractCny(t) && (/[¥￥\u00a5\uffe5₽元]/.test(t) || isLikelyPriceEl(node) || node.closest(PRICE_SEL)))
+        return node;
+      node = node.parentElement;
+    }
+    return el.parentElement || el;
+  }
+
+  function hideAllYuanInRow(row) {
+    if (!row) return;
+    row.dataset.tbPriceRoot = '1';
+    row.querySelectorAll('span, em, i, b, s, div').forEach((s) => {
+      if (s.dataset.tbPrice) return;
       const t = (s.textContent || '').trim();
-      if (!t || /₽/.test(t)) return;
-      if (/^[¥￥\u00a5\uffe5]$/.test(t) || /元/.test(t)) {
+      if (isYuanOnlyText(t)) {
+        s.style.cssText =
+          'display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important;line-height:0!important;margin:0!important;padding:0!important';
         s.dataset.tbPriceHide = '1';
       }
     });
+  }
+
+  function hideYuanSymbol(root) {
+    hideAllYuanInRow(findPriceRow(root));
+    hideAllYuanInRow(root);
   }
 
   function markPrice(el, orig) {
@@ -346,9 +378,11 @@
   }
 
   function replacePriceContainer(el, cny, orig, rate) {
+    const row = findPriceRow(el);
+    hideAllYuanInRow(row);
     markPrice(el, orig);
     el.textContent = formatRub(cny, rate);
-    hideYuanSymbol(el);
+    hideAllYuanInRow(row);
   }
 
   function applyPriceContainer(el, rate) {
@@ -463,11 +497,28 @@
   function fixBrokenRubPrices() {
     document.querySelectorAll('span, em, b, i, strong, div').forEach((el) => {
       if (el.children.length > 0) return;
-      const t = (el.textContent || '').trim();
+      let t = (el.textContent || '').trim();
+      const both = t.match(/^([¥￥\u00a5\uffe5]\s*)?([\d\s.,]+ ₽)(.*)$/);
+      if (both) {
+        el.textContent = both[2] + both[3];
+        el.dataset.tbPrice = '1';
+        hideAllYuanInRow(el.parentElement);
+        return;
+      }
       const m = t.match(/^([\d\s.,]+ ₽)(\d)$/);
       if (m) {
         el.textContent = m[1];
         el.dataset.tbPrice = '1';
+      }
+    });
+
+    document.querySelectorAll('span, em, b, i, strong, div').forEach((el) => {
+      if (!isYuanOnlyText(el.textContent)) return;
+      const row = el.parentElement;
+      if (row && /₽/.test(row.innerText || '')) {
+        el.style.cssText =
+          'display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important';
+        el.dataset.tbPriceHide = '1';
       }
     });
   }
@@ -485,12 +536,8 @@
       });
 
     for (const el of collectPriceContainers()) applyPriceContainer(el, rate);
-  }
 
-  function startPriceWatcher() {
-    if (!CFG.priceRub) return;
-    runPrices();
-    [200, 600, 1200, 2500, 5000].forEach((ms) => setTimeout(runPrices, ms));
+    fixBrokenRubPrices();
   }
 
   let busy = false;
@@ -539,15 +586,17 @@
       if (CFG.priceRub) runPrices();
     } catch (e) {
       console.error('[Taobao TR]', e);
-      const status = document.getElementById('tb-tr-status');
-      if (status) status.textContent = '✗';
+      const st = document.getElementById('tb-tr-status');
+      if (st) st.textContent = '✗';
     } finally {
       busy = false;
     }
   }
 
   function makeUI() {
+    if (document.getElementById('tb-tr-wrap')) return;
     const wrap = document.createElement('div');
+    wrap.id = 'tb-tr-wrap';
     Object.assign(wrap.style, {
       position: 'fixed',
       bottom: '20px',
@@ -611,17 +660,46 @@
     document.body.appendChild(wrap);
   }
 
-  let debounce;
-  const obs = new MutationObserver(() => {
-    clearTimeout(debounce);
-    debounce = setTimeout(() => {
-      if (CFG.priceRub) runPrices();
-      if (CFG.auto) runTranslate();
-    }, 400);
-  });
+  function startPriceWatcher() {
+    if (!CFG.priceRub) return;
+    runPrices();
+    [200, 600, 1200, 2500, 5000].forEach((ms) => setTimeout(runPrices, ms));
+  }
 
-  makeUI();
-  startPriceWatcher();
-  if (CFG.auto) runTranslate();
-  obs.observe(document.body, { childList: true, subtree: true });
+  function startTranslateWatcher() {
+    if (!CFG.auto) return;
+    runTranslate();
+    [400, 1000, 2000, 4000, 8000, 15000].forEach((ms) => setTimeout(runTranslate, ms));
+  }
+
+  let debounce;
+  let booted = false;
+  function boot() {
+    if (booted || !document.body) return;
+    booted = true;
+    makeUI();
+    startPriceWatcher();
+    startTranslateWatcher();
+
+    const obs = new MutationObserver(() => {
+      clearTimeout(debounce);
+      debounce = setTimeout(() => {
+        if (CFG.priceRub) runPrices();
+        if (CFG.auto) runTranslate();
+      }, 350);
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  if (document.body) boot();
+  else {
+    const wait = new MutationObserver(() => {
+      if (document.body) {
+        wait.disconnect();
+        boot();
+      }
+    });
+    wait.observe(document.documentElement, { childList: true });
+    window.addEventListener('load', boot, { once: true });
+  }
 })();
