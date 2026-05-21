@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.1.0
+// @version      1.2.0
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @match        https://*.taobao.com/*
@@ -30,8 +30,11 @@
   const CACHE = new Map();
   const CHINESE = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/;
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'CODE', 'SVG', 'INPUT', 'TEXTAREA']);
-  const BATCH = 10;
   const MIN_LEN = 2;
+  const GOOGLE_LINES = 40;
+  const GOOGLE_PARALLEL = 10;
+  const AI_CHUNK = 100;
+  const AI_PARALLEL = 3;
   const BLOCK_SEL =
     'h1,h2,h3,h4,li,tr,td,th,article,section,[class*="title"],[class*="Title"],[class*="desc"],[class*="Desc"],[class*="spec"],[class*="Spec"],[class*="attr"],[class*="sku"],[class*="param"],[class*="review"],[class*="Review"],[class*="item"],[class*="Item"]';
 
@@ -65,24 +68,11 @@
       'h1,[class*="MainTitle"],[class*="ItemTitle"],[class*="mainTitle"],[data-title]'
     );
     const productTitle = (titleEl?.innerText || document.title || '').trim().slice(0, 280);
-    const crumbs = [...document.querySelectorAll('[class*="breadcrumb"],[class*="BreadCrumb"],nav a')]
-      .map((a) => a.innerText.trim())
-      .filter((t) => CHINESE.test(t))
-      .join(' › ')
-      .slice(0, 200);
 
-    return { pageType, productTitle, crumbs, host: location.hostname };
+    return { pageType, productTitle, host: location.hostname };
   }
 
   let pageCtx = getPageContext();
-  const blockIds = new WeakMap();
-  let blockSeq = 0;
-
-  function getBlockId(block) {
-    if (!block) return 'x';
-    if (!blockIds.has(block)) blockIds.set(block, 'b' + ++blockSeq);
-    return blockIds.get(block);
-  }
 
   function getBlockRoot(el) {
     return el.closest(BLOCK_SEL) || el.parentElement?.closest('div,span,p') || el.parentElement;
@@ -97,22 +87,11 @@
     if (/shop|seller|store/i.test(blob)) return 'seller';
     if (/service|logistic|ship|freight/i.test(blob)) return 'shipping';
     if (/price|Price|promo|coupon/i.test(blob)) return 'promo';
-    if (block?.closest('tr,li')) return 'list-item';
     return 'ui';
   }
 
-  function getLocalContext(block, text) {
-    if (!block) return '';
-    const raw = block.innerText.replace(/\s+/g, ' ').trim();
-    if (raw.length < 120) return raw.slice(0, 120);
-    const i = raw.indexOf(text);
-    if (i < 0) return raw.slice(0, 120);
-    const start = Math.max(0, i - 50);
-    return raw.slice(start, start + 140);
-  }
-
-  function cacheKey(item) {
-    return `${pageCtx.pageType}|${item.section}|${item.text}`;
+  function cacheKey(text) {
+    return `${CFG.lang}|${text}`;
   }
 
   function collectItems(root = document.body) {
@@ -134,60 +113,52 @@
     while ((n = walker.nextNode())) {
       const text = n.textContent.trim();
       const block = getBlockRoot(n.parentElement);
-      const section = detectSection(block, n.parentElement);
-      items.push({
-        node: n,
-        text,
-        section,
-        near: getLocalContext(block, text),
-        blockId: getBlockId(block),
-      });
+      items.push({ node: n, text, section: detectSection(block, n.parentElement) });
     }
     return items;
   }
 
-  function groupBlocks(items) {
-    const blocks = new Map();
-    for (const it of items) {
-      if (!blocks.has(it.blockId)) blocks.set(it.blockId, []);
-      blocks.get(it.blockId).push(it);
-    }
-    return blocks;
-  }
-
-  async function translateGoogle(items, tl, ctx) {
-    const hint = `[${ctx.pageType}] ${ctx.productTitle || ''}`.trim();
+  function chunk(arr, size) {
     const out = [];
-    for (const it of items) {
-      const q = `Taobao ${it.section}. Page: ${hint}. Nearby: ${it.near}. Translate to ${tl}: ${it.text}`;
-      const url =
-        'https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=' +
-        encodeURIComponent(tl) +
-        '&dt=t&q=' +
-        encodeURIComponent(q);
-      const r = await http({ method: 'GET', url });
-      const data = JSON.parse(r.responseText);
-      const full = (data[0] || []).map((x) => x[0]).join('');
-      out.push(cleanGoogle(full, it.text) || it.text);
-    }
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
     return out;
   }
 
-  function cleanGoogle(raw, original) {
-    const m = raw.match(/Translate to \w+:\s*(.+)$/i) || raw.match(/:\s*(.+)$/);
-    return (m ? m[1] : raw).trim();
+  async function runPool(tasks, concurrency) {
+    const results = new Array(tasks.length);
+    let next = 0;
+    async function worker() {
+      while (next < tasks.length) {
+        const i = next++;
+        results[i] = await tasks[i]();
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, worker));
+    return results;
   }
 
-  async function translateOpenAI(items, tl, ctx) {
+  async function translateGoogleBulk(texts, tl) {
+    if (!texts.length) return [];
+    const joined = texts.join('\n');
+    const url =
+      'https://translate.googleapis.com/translate_a/single?client=gtx&sl=zh-CN&tl=' +
+      encodeURIComponent(tl) +
+      '&dt=t&q=' +
+      encodeURIComponent(joined);
+    const r = await http({ method: 'GET', url });
+    const data = JSON.parse(r.responseText);
+    const full = (data[0] || []).map((x) => x[0]).join('');
+    const lines = full.split('\n').map((s) => s.trim());
+    if (lines.length === texts.length) return lines;
+    if (texts.length === 1) return [full.trim()];
+    return texts.map((t, i) => lines[i]?.trim() || full.trim());
+  }
+
+  async function translateOpenAIChunk(texts, tl, ctx) {
     const payload = {
       page: ctx,
       targetLang: tl,
-      items: items.map((it, i) => ({
-        id: i + 1,
-        section: it.section,
-        text: it.text,
-        context: it.near,
-      })),
+      items: texts.map((text, i) => ({ id: i + 1, text })),
     };
     const r = await http({
       method: 'POST',
@@ -198,15 +169,12 @@
       },
       data: JSON.stringify({
         model: 'gpt-4o-mini',
-        temperature: 0.15,
+        temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
           {
             role: 'system',
-            content: `You translate Chinese Taobao/Tmall e-commerce text to ${tl}.
-Use page context (product title, category, page type) and each item's section (title, spec, review, shipping, etc.) plus nearby "context" text.
-Rules: keep brand/model/SKU codes; translate sizes naturally; spec labels and values must stay paired logically; UI buttons concise.
-Return JSON only: {"items":[{"id":number,"text":"translation"}]} — same ids, same count.`,
+            content: `Translate Chinese Taobao/Tmall e-commerce UI to ${tl}. Page: ${ctx.pageType}, product: ${ctx.productTitle || 'n/a'}. Keep brands/SKU codes. Return JSON: {"items":[{"id":number,"text":"translation"}]} — same ids, same count.`,
           },
           { role: 'user', content: JSON.stringify(payload) },
         ],
@@ -216,103 +184,110 @@ Return JSON only: {"items":[{"id":number,"text":"translation"}]} — same ids, s
     const body = JSON.parse(r.responseText);
     const parsed = JSON.parse(body.choices?.[0]?.message?.content || '{}');
     const map = new Map((parsed.items || []).map((x) => [x.id, x.text]));
-    return items.map((_, i) => map.get(i + 1)?.trim() || items[i].text);
+    return texts.map((t, i) => map.get(i + 1)?.trim() || t);
   }
 
-  async function translateBlock(blockItems, tl) {
-    const combined = blockItems.map((x) => x.text).join(' / ');
-    if (combined.length > 380 || blockItems.length < 2) return null;
-
+  async function translateUnique(texts, tl, onChunk) {
     const useAI = CFG.engine === 'openai' || (CFG.engine === 'auto' && CFG.apiKey.length > 10);
-    const section = blockItems[0].section;
-    const single = { text: combined, section, near: getLocalContext(getBlockRoot(blockItems[0].node.parentElement), combined) };
+    const chunks = chunk(texts, useAI ? AI_CHUNK : GOOGLE_LINES);
 
-    let tr;
-    if (useAI) {
+    const tasks = chunks.map((part) => async () => {
+      let translated;
       try {
-        [tr] = await translateOpenAI([single], tl, pageCtx);
+        translated = useAI ? await translateOpenAIChunk(part, tl, pageCtx) : await translateGoogleBulk(part, tl);
       } catch {
-        [tr] = await translateGoogle([single], tl, pageCtx);
+        translated = await translateGoogleBulk(part, tl);
       }
-    } else {
-      [tr] = await translateGoogle([single], tl, pageCtx);
-    }
-    if (!tr || tr === combined) return null;
-    return blockItems.map((it, i) => {
-      const parts = tr.split(/\s*\/\s*|\s*\|\s*/);
-      return parts[i]?.trim() || tr;
+      part.forEach((src, i) => {
+        const tr = translated[i] || src;
+        CACHE.set(cacheKey(src), tr);
+      });
+      onChunk(part, translated);
+      return translated;
     });
+
+    await runPool(tasks, useAI ? AI_PARALLEL : GOOGLE_PARALLEL);
   }
 
-  async function translateBatch(items, tl) {
-    const useAI = CFG.engine === 'openai' || (CFG.engine === 'auto' && CFG.apiKey.length > 10);
-    try {
-      return useAI ? await translateOpenAI(items, tl, pageCtx) : await translateGoogle(items, tl, pageCtx);
-    } catch {
-      return translateGoogle(items, tl, pageCtx);
+  function applyToNodes(items, textMap) {
+    for (const it of items) {
+      const tr = textMap.get(it.text);
+      if (!tr || tr === it.text) continue;
+      const el = it.node.parentElement;
+      if (!el || el.dataset.tbTr) continue;
+      el.dataset.tbTr = '1';
+      el.title = it.text;
+      it.node.textContent = it.node.textContent.replace(it.text, tr);
     }
-  }
-
-  function applyTranslation(item, tr) {
-    if (!tr || tr === item.text) return;
-    const el = item.node.parentElement;
-    if (!el || el.dataset.tbTr) return;
-    el.dataset.tbTr = '1';
-    el.title = (pageCtx.productTitle ? pageCtx.productTitle + '\n' : '') + item.text;
-    item.node.textContent = item.node.textContent.replace(item.text, tr);
   }
 
   let busy = false;
+  let runId = 0;
 
   async function runTranslate() {
     if (busy) return;
     busy = true;
+    const id = ++runId;
+    const status = document.getElementById('tb-tr-status');
     try {
       pageCtx = getPageContext();
       const items = collectItems();
-      const blocks = groupBlocks(items);
-
-      for (const [, blockItems] of blocks) {
-        const todo = blockItems.filter((it) => !CACHE.has(cacheKey(it)));
-        if (!todo.length) continue;
-
-        const blockTr = await translateBlock(todo, CFG.lang);
-        if (blockTr) {
-          todo.forEach((it, j) => {
-            const tr = blockTr[j];
-            CACHE.set(cacheKey(it), tr);
-            applyTranslation(it, tr);
-          });
-          continue;
-        }
-
-        for (let i = 0; i < todo.length; i += BATCH) {
-          const chunk = todo.slice(i, i + BATCH);
-          const res = await translateBatch(chunk, CFG.lang);
-          chunk.forEach((it, j) => {
-            const tr = res[j] || it.text;
-            CACHE.set(cacheKey(it), tr);
-            applyTranslation(it, tr);
-          });
-        }
+      const byText = new Map();
+      for (const it of items) {
+        if (!byText.has(it.text)) byText.set(it.text, []);
+        byText.get(it.text).push(it);
       }
 
-      items.filter((it) => CACHE.has(cacheKey(it))).forEach((it) => {
-        if (!it.node.parentElement?.dataset.tbTr) applyTranslation(it, CACHE.get(cacheKey(it)));
+      const todo = [...byText.keys()].filter((t) => !CACHE.has(cacheKey(t)));
+
+      const cachedMap = new Map();
+      for (const t of byText.keys()) {
+        const tr = CACHE.get(cacheKey(t));
+        if (tr) cachedMap.set(t, tr);
+      }
+      applyToNodes(items, cachedMap);
+
+      if (!todo.length) {
+        if (status) status.textContent = '✓';
+        return;
+      }
+
+      let left = todo.length;
+      if (status) status.textContent = `… ${left}`;
+
+      await translateUnique(todo, CFG.lang, (part, translated) => {
+        if (id !== runId) return;
+        const map = new Map(part.map((t, i) => [t, translated[i] || t]));
+        applyToNodes(part.flatMap((t) => byText.get(t) || []), map);
+        left -= part.length;
+        if (status) status.textContent = left > 0 ? `… ${left}` : '✓';
       });
+
+      if (id === runId && status) status.textContent = '✓';
+    } catch (e) {
+      console.error('[Taobao TR]', e);
+      const status = document.getElementById('tb-tr-status');
+      if (status) status.textContent = '✗';
     } finally {
       busy = false;
     }
   }
 
   function makeUI() {
-    const btn = document.createElement('button');
-    btn.textContent = '🇷🇺 Перевести';
-    Object.assign(btn.style, {
+    const wrap = document.createElement('div');
+    Object.assign(wrap.style, {
       position: 'fixed',
       bottom: '20px',
       right: '20px',
       zIndex: '2147483646',
+      display: 'flex',
+      gap: '6px',
+      alignItems: 'center',
+    });
+
+    const btn = document.createElement('button');
+    btn.textContent = '🇷🇺 Перевести';
+    Object.assign(btn.style, {
       padding: '10px 14px',
       border: 'none',
       borderRadius: '8px',
@@ -322,29 +297,33 @@ Return JSON only: {"items":[{"id":number,"text":"translation"}]} — same ids, s
       cursor: 'pointer',
       boxShadow: '0 2px 12px rgba(0,0,0,.25)',
     });
-    btn.onclick = async () => {
-      btn.disabled = true;
-      btn.textContent = '…';
+
+    const status = document.createElement('span');
+    status.id = 'tb-tr-status';
+    status.textContent = '…';
+    Object.assign(status.style, {
+      padding: '6px 10px',
+      borderRadius: '8px',
+      background: 'rgba(0,0,0,.65)',
+      color: '#fff',
+      font: '12px/1 system-ui,sans-serif',
+    });
+
+    btn.onclick = () => {
       CACHE.clear();
-      try {
-        await runTranslate();
-        btn.textContent = '✓ Готово';
-      } catch (e) {
-        btn.textContent = '✗ Ошибка';
-        console.error('[Taobao TR]', e);
-      }
-      setTimeout(() => {
-        btn.disabled = false;
-        btn.textContent = '🇷🇺 Перевести';
-      }, 2000);
+      runId++;
+      runTranslate();
     };
-    document.body.appendChild(btn);
+
+    wrap.append(btn, status);
+    document.body.appendChild(wrap);
   }
 
   let debounce;
   const obs = new MutationObserver(() => {
+    if (!CFG.auto) return;
     clearTimeout(debounce);
-    debounce = setTimeout(() => CFG.auto && runTranslate(), 1500);
+    debounce = setTimeout(runTranslate, 600);
   });
 
   makeUI();
