@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.4.0
+// @version      1.4.1
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @match        https://*.taobao.com/*
@@ -244,6 +244,23 @@
     return `${CFG.lang}|${text}`;
   }
 
+  function ensureTranslateCss() {
+    if (document.getElementById('tb-tr-css')) return;
+    const st = document.createElement('style');
+    st.id = 'tb-tr-css';
+    st.textContent =
+      '[data-tb-tr]{white-space:normal!important;word-break:break-word!important;overflow:visible!important;text-overflow:unset!important}' +
+      '[data-tb-tr-block]{display:block!important;width:100%!important;height:auto!important;min-height:0!important;white-space:normal!important;line-height:1.45!important;word-break:break-word!important;overflow:visible!important}';
+    document.head.appendChild(st);
+  }
+
+  function markLayoutFix(el) {
+    const block = el.closest(
+      '[class*="agree" i],[class*="protocol" i],[class*="clause" i],[class*="footer" i],[class*="login" i],[class*="Login" i],label,form'
+    );
+    if (block && (block.innerText || '').length < 600) block.dataset.tbTrBlock = '1';
+  }
+
   function collectItems(root = document.body) {
     const items = [];
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
@@ -263,9 +280,36 @@
     while ((n = walker.nextNode())) {
       const text = n.textContent.trim();
       const block = getBlockRoot(n.parentElement);
-      items.push({ node: n, text, section: detectSection(block, n.parentElement) });
+      items.push({ node: n, text, section: detectSection(block, n.parentElement), kind: 'text' });
     }
     return items;
+  }
+
+  function collectAttrItems(root = document.body) {
+    const items = [];
+    root.querySelectorAll('input, textarea, select').forEach((el) => {
+      if (el.dataset.tbTrAttr) return;
+      for (const attr of ['placeholder', 'aria-label', 'title', 'alt']) {
+        const v = el.getAttribute(attr);
+        if (v && CHINESE.test(v)) items.push({ el, attr, text: v.trim(), kind: 'attr' });
+      }
+    });
+    root
+      .querySelectorAll(
+        '[class*="placeholder" i],[class*="Placeholder" i],[class*="label" i][class*="input" i],[class*="Label" i]'
+      )
+      .forEach((el) => {
+        if (el.dataset.tbTr || el.dataset.tbTrAttr || el.children.length > 0) return;
+        if (!el.closest('form, [class*="login" i], [class*="Login" i], [class*="input" i], [class*="Input" i]'))
+          return;
+        const t = (el.textContent || '').trim();
+        if (t.length >= MIN_LEN && CHINESE.test(t)) items.push({ el, attr: null, text: t, kind: 'pseudo' });
+      });
+    return items;
+  }
+
+  function collectAllItems() {
+    return [...collectItems(), ...collectAttrItems()];
   }
 
   function chunk(arr, size) {
@@ -361,15 +405,42 @@
   }
 
   function applyToNodes(items, textMap) {
+    ensureTranslateCss();
     for (const it of items) {
+      if (it.kind !== 'text') continue;
       const tr = textMap.get(it.text);
       if (!tr || tr === it.text) continue;
       const el = it.node.parentElement;
       if (!el || el.dataset.tbTr) continue;
       el.dataset.tbTr = '1';
       el.title = it.text;
+      markLayoutFix(el);
       it.node.textContent = it.node.textContent.replace(it.text, tr);
     }
+  }
+
+  function applyAttrItems(items, textMap) {
+    ensureTranslateCss();
+    for (const it of items) {
+      if (it.kind === 'text') continue;
+      const tr = textMap.get(it.text);
+      if (!tr || tr === it.text) continue;
+      if (it.kind === 'attr') {
+        it.el.setAttribute(it.attr, tr);
+        it.el.dataset.tbTrAttr = '1';
+        it.el.title = it.text;
+      } else if (it.kind === 'pseudo') {
+        it.el.textContent = tr;
+        it.el.dataset.tbTrAttr = '1';
+        it.el.title = it.text;
+        markLayoutFix(it.el);
+      }
+    }
+  }
+
+  function applyAll(items, textMap) {
+    applyToNodes(items, textMap);
+    applyAttrItems(items, textMap);
   }
 
   function parseCnyNum(s) {
@@ -676,7 +747,8 @@
     const status = document.getElementById('tb-tr-status');
     try {
       pageCtx = getPageContext();
-      const items = collectItems();
+      ensureTranslateCss();
+      const items = collectAllItems();
       const byText = new Map();
       for (const it of items) {
         if (!byText.has(it.text)) byText.set(it.text, []);
@@ -690,7 +762,7 @@
         const tr = CACHE.get(cacheKey(t));
         if (tr) cachedMap.set(t, tr);
       }
-      applyToNodes(items, cachedMap);
+      applyAll(items, cachedMap);
 
       if (!todo.length) {
         if (status) status.textContent = '✓';
@@ -703,7 +775,7 @@
       await translateUnique(todo, CFG.lang, (part, translated) => {
         if (id !== runId) return;
         const map = new Map(part.map((t, i) => [t, translated[i] || t]));
-        applyToNodes(part.flatMap((t) => byText.get(t) || []), map);
+        applyAll(part.flatMap((t) => byText.get(t) || []), map);
         left -= part.length;
         if (status) status.textContent = left > 0 ? `… ${left}` : '✓';
       });
