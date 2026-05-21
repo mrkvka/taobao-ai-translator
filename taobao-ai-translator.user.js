@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.4.2
+// @version      1.5.0
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @updateURL    https://raw.githubusercontent.com/mrkvka/taobao-ai-translator/main/taobao-ai-translator.user.js
@@ -157,9 +157,8 @@
       });
       saveManualRate(rate);
       syncUI();
-      box.querySelector('#tb-s-msg').textContent = '✓ Сохранено — настройки не сбросятся при обновлении';
-      if (CFG.priceRub) startPriceWatcher();
-      if (CFG.auto) startTranslateWatcher();
+      box.querySelector('#tb-s-msg').textContent = '✓ Сохранено';
+      runInitialPass();
     };
   }
 
@@ -183,7 +182,33 @@
   function togglePriceRub() {
     saveCfg({ priceRub: !CFG.priceRub });
     syncUI();
-    if (CFG.priceRub) startPriceWatcher();
+    if (CFG.priceRub) runPrices();
+  }
+
+  const OUR_SEL = '#tb-tr-wrap,#tb-tr-settings,#tb-tr-settings-bg';
+  const SCAN_DEBOUNCE = 2500;
+  const LOAD_RETRIES = [800, 2500];
+
+  function isOurNode(el) {
+    return el && el.closest && el.closest(OUR_SEL);
+  }
+
+  let pauseMut = 0;
+  let busy = false;
+  let priceBusy = false;
+  let runId = 0;
+  let scanTimer = null;
+
+  function pauseDom() {
+    pauseMut++;
+    return () => {
+      pauseMut = Math.max(0, pauseMut - 1);
+    };
+  }
+
+  function isHiddenEl(el) {
+    if (!el || el.hidden) return true;
+    return !el.getClientRects().length;
   }
 
   const CACHE = new Map();
@@ -268,13 +293,10 @@
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(n) {
         const p = n.parentElement;
-        if (!p || SKIP.has(p.tagName) || p.closest('[data-tb-tr]')) return NodeFilter.FILTER_REJECT;
-        if (p.isContentEditable || p.hidden) return NodeFilter.FILTER_REJECT;
+        if (!p || SKIP.has(p.tagName) || isOurNode(p) || p.closest('[data-tb-tr]')) return NodeFilter.FILTER_REJECT;
+        if (p.isContentEditable || p.hidden || isHiddenEl(p)) return NodeFilter.FILTER_REJECT;
         const t = n.textContent.trim();
         if (t.length < MIN_LEN || !CHINESE.test(t)) return NodeFilter.FILTER_REJECT;
-        const st = getComputedStyle(p);
-        if (st.display === 'none' || st.visibility === 'hidden' || +st.opacity === 0)
-          return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       },
     });
@@ -290,28 +312,24 @@
   function collectAttrItems(root = document.body) {
     const items = [];
     root.querySelectorAll('input, textarea, select').forEach((el) => {
-      if (el.dataset.tbTrAttr) return;
+      if (el.dataset.tbTrAttr || isOurNode(el)) return;
       for (const attr of ['placeholder', 'aria-label', 'title', 'alt']) {
         const v = el.getAttribute(attr);
         if (v && CHINESE.test(v)) items.push({ el, attr, text: v.trim(), kind: 'attr' });
       }
     });
-    root
-      .querySelectorAll(
-        '[class*="placeholder" i],[class*="Placeholder" i],[class*="label" i][class*="input" i],[class*="Label" i]'
-      )
-      .forEach((el) => {
-        if (el.dataset.tbTr || el.dataset.tbTrAttr || el.children.length > 0) return;
-        if (!el.closest('form, [class*="login" i], [class*="Login" i], [class*="input" i], [class*="Input" i]'))
-          return;
-        const t = (el.textContent || '').trim();
-        if (t.length >= MIN_LEN && CHINESE.test(t)) items.push({ el, attr: null, text: t, kind: 'pseudo' });
-      });
+    root.querySelectorAll('[class*="placeholder" i],[class*="Placeholder" i]').forEach((el) => {
+      if (el.dataset.tbTr || el.dataset.tbTrAttr || el.children.length > 0 || isOurNode(el)) return;
+      if (!el.closest('form, [class*="login" i], [class*="Login" i], [class*="input" i], [class*="Input" i]'))
+        return;
+      const t = (el.textContent || '').trim();
+      if (t.length >= MIN_LEN && CHINESE.test(t)) items.push({ el, attr: null, text: t, kind: 'pseudo' });
+    });
     return items;
   }
 
-  function collectAllItems() {
-    return [...collectItems(), ...collectAttrItems()];
+  function collectAllItems(root = document.body) {
+    return [...collectItems(root), ...collectAttrItems(root)];
   }
 
   function chunk(arr, size) {
@@ -408,35 +426,45 @@
 
   function applyToNodes(items, textMap) {
     ensureTranslateCss();
-    for (const it of items) {
-      if (it.kind !== 'text') continue;
-      const tr = textMap.get(it.text);
-      if (!tr || tr === it.text) continue;
-      const el = it.node.parentElement;
-      if (!el || el.dataset.tbTr) continue;
-      el.dataset.tbTr = '1';
-      el.title = it.text;
-      markLayoutFix(el);
-      it.node.textContent = it.node.textContent.replace(it.text, tr);
+    const done = pauseDom();
+    try {
+      for (const it of items) {
+        if (it.kind !== 'text') continue;
+        const tr = textMap.get(it.text);
+        if (!tr || tr === it.text) continue;
+        const el = it.node.parentElement;
+        if (!el || el.dataset.tbTr) continue;
+        el.dataset.tbTr = '1';
+        el.title = it.text;
+        markLayoutFix(el);
+        it.node.textContent = it.node.textContent.replace(it.text, tr);
+      }
+    } finally {
+      done();
     }
   }
 
   function applyAttrItems(items, textMap) {
     ensureTranslateCss();
-    for (const it of items) {
-      if (it.kind === 'text') continue;
-      const tr = textMap.get(it.text);
-      if (!tr || tr === it.text) continue;
-      if (it.kind === 'attr') {
-        it.el.setAttribute(it.attr, tr);
-        it.el.dataset.tbTrAttr = '1';
-        it.el.title = it.text;
-      } else if (it.kind === 'pseudo') {
-        it.el.textContent = tr;
-        it.el.dataset.tbTrAttr = '1';
-        it.el.title = it.text;
-        markLayoutFix(it.el);
+    const done = pauseDom();
+    try {
+      for (const it of items) {
+        if (it.kind === 'text') continue;
+        const tr = textMap.get(it.text);
+        if (!tr || tr === it.text) continue;
+        if (it.kind === 'attr') {
+          it.el.setAttribute(it.attr, tr);
+          it.el.dataset.tbTrAttr = '1';
+          it.el.title = it.text;
+        } else if (it.kind === 'pseudo') {
+          it.el.textContent = tr;
+          it.el.dataset.tbTrAttr = '1';
+          it.el.title = it.text;
+          markLayoutFix(it.el);
+        }
       }
+    } finally {
+      done();
     }
   }
 
@@ -458,29 +486,16 @@
   }
 
   function isVisible(el) {
-    if (!el || el.hidden) return false;
-    const st = getComputedStyle(el);
-    return st.display !== 'none' && st.visibility !== 'hidden' && +st.opacity !== 0;
+    return !isHiddenEl(el);
   }
 
   function isLikelyPriceEl(el) {
-    if (!el || !isVisible(el) || el.closest('[data-tb-price]')) return false;
+    if (!el || isHiddenEl(el) || el.closest('[data-tb-price]') || isOurNode(el)) return false;
     if (el.closest(PRICE_SEL)) return true;
     const cls = (el.className || '').toString();
-    if (
-      /price|Price|rmb|RMB|amount|Amount|money|Money|total|Total|fee|Fee|integer|Integer|decimal|Decimal|num|Num|value|Value|currency|Currency|unit|Unit|symbol|Symbol|sale|Sale|promo|Promo|deal|Deal/i.test(
-        cls
-      )
-    )
-      return true;
-    const c = getComputedStyle(el).color.replace(/\s/g, '');
-    if (/255,80,0|#ff5000|#ff4400|#f40|rgb\(255,/.test(c)) return true;
-    const t = el.textContent?.trim() || '';
-    if (/^\d{2,6}(\.\d{1,2})?$/.test(t)) {
-      const fw = getComputedStyle(el).fontWeight;
-      if (+fw >= 600 || fw === 'bold') return true;
-    }
-    return false;
+    return /price|Price|rmb|RMB|amount|Amount|money|Money|total|Total|currency|Currency|unit|Unit|symbol|Symbol/i.test(
+      cls
+    );
   }
 
   function ensurePriceCss() {
@@ -576,48 +591,52 @@
     return cny ? String(cny) : null;
   }
 
+  function applyPriceContainer(el, rate) {
+    if (!el || el.dataset.tbPrice || !isVisible(el) || el.closest('[data-tb-price]') || isOurNode(el)) return false;
+    const done = pauseDom();
+    try {
+      if (isDigitSplitContainer(el)) {
+        const combined = combineSplitDigits(el);
+        const cny = parseCnyNum(combined);
+        if (cny > 0 && cny < 10000000) {
+          replacePriceContainer(el, cny, combined, rate);
+          return true;
+        }
+      }
+
+      const raw = (el.innerText || el.textContent || '').trim();
+      if (!raw || /₽/.test(raw)) return false;
+
+      if (isPurePriceText(raw)) {
+        const cny = extractCny(raw);
+        if (cny > 0 && cny < 10000000) {
+          replacePriceContainer(el, cny, raw, rate);
+          return true;
+        }
+      }
+
+      if (/[¥￥\u00a5\uffe5]|元/.test(raw)) {
+        const next = convertAnyPrice(raw, rate, el);
+        if (next && next !== raw) {
+          markPrice(el, raw);
+          el.textContent = next;
+          hideYuanSymbol(el);
+          return true;
+        }
+      }
+
+      return false;
+    } finally {
+      done();
+    }
+  }
+
   function replacePriceContainer(el, cny, orig, rate) {
     const row = findPriceRow(el);
     hideAllYuanInRow(row);
     markPrice(el, orig);
     el.textContent = formatRub(cny, rate);
     hideAllYuanInRow(row);
-  }
-
-  function applyPriceContainer(el, rate) {
-    if (!el || el.dataset.tbPrice || !isVisible(el) || el.closest('[data-tb-price]')) return false;
-
-    if (isDigitSplitContainer(el)) {
-      const combined = combineSplitDigits(el);
-      const cny = parseCnyNum(combined);
-      if (cny > 0 && cny < 10000000) {
-        replacePriceContainer(el, cny, combined, rate);
-        return true;
-      }
-    }
-
-    const raw = (el.innerText || el.textContent || '').trim();
-    if (!raw || /₽/.test(raw)) return false;
-
-    if (isPurePriceText(raw)) {
-      const cny = extractCny(raw);
-      if (cny > 0 && cny < 10000000) {
-        replacePriceContainer(el, cny, raw, rate);
-        return true;
-      }
-    }
-
-    if (/[¥￥\u00a5\uffe5]|元/.test(raw)) {
-      const next = convertAnyPrice(raw, rate, el);
-      if (next && next !== raw) {
-        markPrice(el, raw);
-        el.textContent = next;
-        hideYuanSymbol(el);
-        return true;
-      }
-    }
-
-    return false;
   }
 
   async function getCnyRubRate() {
@@ -676,81 +695,62 @@
     return formatRub(cny, rate) + m[2];
   }
 
-  function collectPriceContainers() {
+  function collectPriceContainers(root = document.body) {
     const set = new Set();
-    document.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((el) => {
-      set.add(el);
-      el.querySelectorAll('span, em, b, i, strong, div').forEach((c) => {
-        if (isDigitSplitContainer(c) || isPurePriceText((c.innerText || c.textContent || '').trim())) set.add(c);
+    root.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((el) => {
+      if (isOurNode(el)) return;
+      if (isDigitSplitContainer(el) || isPurePriceText((el.innerText || '').trim())) set.add(el);
+      el.querySelectorAll('span, em, b, i').forEach((c) => {
+        if (isDigitSplitContainer(c) || isPurePriceText((c.textContent || '').trim())) set.add(c);
       });
     });
-    document.querySelectorAll('span, em, b, strong, div').forEach((el) => {
-      if (isDigitSplitContainer(el)) set.add(el);
-      else if (el.children.length === 0 && isLikelyPriceEl(el) && isPurePriceText(el.textContent)) set.add(el);
-    });
-    return [...set]
-      .filter((el) => isVisible(el) && !el.closest('[data-tb-price]'))
-      .sort((a, b) => (a.innerText?.length || 0) - (b.innerText?.length || 0));
+    return [...set].filter((el) => isVisible(el) && !el.closest('[data-tb-price]'));
   }
 
-  function fixBrokenRubPrices() {
-    document.querySelectorAll('span, em, b, i, strong, div').forEach((el) => {
-      if (el.children.length > 0) return;
-      let t = (el.textContent || '').trim();
-      const both = t.match(/^([¥￥\u00a5\uffe5]\s*)?([\d\s.,]+ ₽)(.*)$/);
-      if (both) {
-        el.textContent = both[2] + both[3];
-        el.dataset.tbPrice = '1';
-        hideAllYuanInRow(el.parentElement);
-        return;
-      }
-      const m = t.match(/^([\d\s.,]+ ₽)(\d)$/);
-      if (m) {
-        el.textContent = m[1];
-        el.dataset.tbPrice = '1';
-      }
-    });
-
-    document.querySelectorAll('span, em, b, i, strong, div').forEach((el) => {
-      if (!isYuanOnlyText(el.textContent)) return;
-      const row = el.parentElement;
-      if (row && /₽/.test(row.innerText || '')) {
-        el.style.cssText =
-          'display:none!important;width:0!important;height:0!important;overflow:hidden!important;font-size:0!important';
-        el.dataset.tbPriceHide = '1';
-      }
-    });
-  }
-
-  async function runPrices() {
-    if (!CFG.priceRub) return;
-    ensurePriceCss();
-    fixBrokenRubPrices();
-    const rate = await getCnyRubRate();
-
-    document
-      .querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"], span, em, b, strong, div')
-      .forEach((el) => {
-        if (isDigitSplitContainer(el)) applyPriceContainer(el, rate);
+  function fixBrokenRubPrices(root = document.body) {
+    root.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((block) => {
+      block.querySelectorAll('span, em, b, i').forEach((el) => {
+        if (el.children.length > 0) return;
+        let t = (el.textContent || '').trim();
+        const both = t.match(/^([¥￥\u00a5\uffe5]\s*)?([\d\s.,]+ ₽)(.*)$/);
+        if (both) {
+          el.textContent = both[2] + both[3];
+          el.dataset.tbPrice = '1';
+          hideAllYuanInRow(el.parentElement);
+          return;
+        }
+        if (isYuanOnlyText(t) && /₽/.test(block.innerText || '')) {
+          el.style.cssText = 'display:none!important;width:0!important;height:0!important;font-size:0!important';
+          el.dataset.tbPriceHide = '1';
+        }
       });
-
-    for (const el of collectPriceContainers()) applyPriceContainer(el, rate);
-
-    fixBrokenRubPrices();
+    });
   }
 
-  let busy = false;
-  let runId = 0;
+  async function runPrices(root = document.body) {
+    if (!CFG.priceRub || priceBusy) return;
+    priceBusy = true;
+    const done = pauseDom();
+    try {
+      ensurePriceCss();
+      fixBrokenRubPrices(root);
+      const rate = await getCnyRubRate();
+      for (const el of collectPriceContainers(root)) applyPriceContainer(el, rate);
+    } finally {
+      done();
+      priceBusy = false;
+    }
+  }
 
-  async function runTranslate() {
-    if (busy) return;
+  async function runTranslate(root = document.body) {
+    if (busy || pauseMut > 0) return;
     busy = true;
     const id = ++runId;
     const status = document.getElementById('tb-tr-status');
     try {
       pageCtx = getPageContext();
       ensureTranslateCss();
-      const items = collectAllItems();
+      const items = collectAllItems(root);
       const byText = new Map();
       for (const it of items) {
         if (!byText.has(it.text)) byText.set(it.text, []);
@@ -783,7 +783,7 @@
       });
 
       if (id === runId && status) status.textContent = '✓';
-      if (CFG.priceRub) runPrices();
+      if (CFG.priceRub) await runPrices(root);
     } catch (e) {
       console.error('[Taobao TR]', e);
       const st = document.getElementById('tb-tr-status');
@@ -873,35 +873,46 @@
     document.body.appendChild(wrap);
   }
 
-  function startPriceWatcher() {
-    if (!CFG.priceRub) return;
-    runPrices();
-    [200, 600, 1200, 2500, 5000].forEach((ms) => setTimeout(runPrices, ms));
+  function scheduleScan() {
+    if (pauseMut > 0 || busy || priceBusy) return;
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(() => {
+      if (pauseMut > 0 || busy || priceBusy) return;
+      if (CFG.auto) runTranslate();
+      else if (CFG.priceRub) runPrices();
+    }, SCAN_DEBOUNCE);
   }
 
-  function startTranslateWatcher() {
-    if (!CFG.auto) return;
-    runTranslate();
-    [400, 1000, 2000, 4000, 8000, 15000].forEach((ms) => setTimeout(runTranslate, ms));
+  function runInitialPass() {
+    if (CFG.priceRub) runPrices();
+    if (CFG.auto) runTranslate();
+    LOAD_RETRIES.forEach((ms) =>
+      setTimeout(() => {
+        if (CFG.priceRub) runPrices();
+        if (CFG.auto) runTranslate();
+      }, ms)
+    );
   }
 
-  let debounce;
   let booted = false;
   function boot() {
     if (booted || !document.body) return;
     booted = true;
     makeUI();
-    startPriceWatcher();
-    startTranslateWatcher();
+    runInitialPass();
 
-    const obs = new MutationObserver(() => {
-      clearTimeout(debounce);
-      debounce = setTimeout(() => {
-        if (CFG.priceRub) runPrices();
-        if (CFG.auto) runTranslate();
-      }, 350);
+    const obs = new MutationObserver((mutations) => {
+      if (pauseMut > 0) return;
+      const roots = [];
+      for (const m of mutations) {
+        if (isOurNode(m.target)) continue;
+        for (const n of m.addedNodes) {
+          if (n.nodeType === 1 && !isOurNode(n)) roots.push(n);
+        }
+      }
+      if (roots.length) scheduleScan();
     });
-    obs.observe(document.documentElement, { childList: true, subtree: true });
+    obs.observe(document.body, { childList: true, subtree: true });
   }
 
   if (document.body) boot();
