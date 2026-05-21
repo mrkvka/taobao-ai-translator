@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.3.3
+// @version      1.4.0
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @match        https://*.taobao.com/*
@@ -24,13 +24,165 @@
 (function () {
   'use strict';
 
-  const CFG = {
-    apiKey: GM_getValue('apiKey', ''),
-    lang: GM_getValue('lang', 'ru'),
-    auto: GM_getValue('auto', true),
-    engine: GM_getValue('engine', 'auto'),
-    priceRub: GM_getValue('priceRub', false),
+  const STORE = {
+    apiKey: 'tbtr.apiKey',
+    lang: 'tbtr.lang',
+    auto: 'tbtr.auto',
+    engine: 'tbtr.engine',
+    priceRub: 'tbtr.priceRub',
+    cnyRubManual: 'tbtr.cnyRubManual',
+    cnyRubRate: 'tbtr.cnyRubRate',
+    cnyRubRateAt: 'tbtr.cnyRubRateAt',
   };
+
+  function migrateStore() {
+    const old = {
+      apiKey: GM_getValue('apiKey', null),
+      lang: GM_getValue('lang', null),
+      auto: GM_getValue('auto', null),
+      engine: GM_getValue('engine', null),
+      priceRub: GM_getValue('priceRub', null),
+      cnyRubManual: GM_getValue('cnyRubManual', null),
+      cnyRubRate: GM_getValue('cnyRubRate', null),
+      cnyRubRateAt: GM_getValue('cnyRubRateAt', null),
+    };
+    if (old.apiKey !== null && GM_getValue(STORE.apiKey, null) === null) GM_setValue(STORE.apiKey, old.apiKey);
+    if (old.lang !== null && GM_getValue(STORE.lang, null) === null) GM_setValue(STORE.lang, old.lang);
+    if (old.auto !== null && GM_getValue(STORE.auto, null) === null) GM_setValue(STORE.auto, old.auto);
+    if (old.engine !== null && GM_getValue(STORE.engine, null) === null) GM_setValue(STORE.engine, old.engine);
+    if (old.priceRub !== null && GM_getValue(STORE.priceRub, null) === null) GM_setValue(STORE.priceRub, old.priceRub);
+    if (old.cnyRubManual !== null && GM_getValue(STORE.cnyRubManual, null) === null)
+      GM_setValue(STORE.cnyRubManual, old.cnyRubManual);
+    if (old.cnyRubRate !== null && GM_getValue(STORE.cnyRubRate, null) === null)
+      GM_setValue(STORE.cnyRubRate, old.cnyRubRate);
+    if (old.cnyRubRateAt !== null && GM_getValue(STORE.cnyRubRateAt, null) === null)
+      GM_setValue(STORE.cnyRubRateAt, old.cnyRubRateAt);
+  }
+
+  migrateStore();
+
+  const CFG = loadCfg();
+
+  function loadCfg() {
+    return {
+      apiKey: GM_getValue(STORE.apiKey, ''),
+      lang: GM_getValue(STORE.lang, 'ru'),
+      auto: GM_getValue(STORE.auto, true),
+      engine: GM_getValue(STORE.engine, 'auto'),
+      priceRub: GM_getValue(STORE.priceRub, false),
+    };
+  }
+
+  function saveCfg(partial) {
+    Object.assign(CFG, partial);
+    if ('apiKey' in partial) GM_setValue(STORE.apiKey, CFG.apiKey);
+    if ('lang' in partial) GM_setValue(STORE.lang, CFG.lang);
+    if ('auto' in partial) GM_setValue(STORE.auto, CFG.auto);
+    if ('engine' in partial) GM_setValue(STORE.engine, CFG.engine);
+    if ('priceRub' in partial) GM_setValue(STORE.priceRub, CFG.priceRub);
+  }
+
+  function saveManualRate(val) {
+    GM_setValue(STORE.cnyRubManual, val > 0 ? val : 0);
+    cnyRubRate = null;
+  }
+
+  GM_registerMenuCommand('⚙ Настройки', openSettings);
+
+  function openSettings() {
+    document.getElementById('tb-tr-settings')?.remove();
+    const box = document.createElement('div');
+    box.id = 'tb-tr-settings';
+    Object.assign(box.style, {
+      position: 'fixed',
+      top: '50%',
+      left: '50%',
+      transform: 'translate(-50%,-50%)',
+      zIndex: '2147483647',
+      background: '#fff',
+      color: '#222',
+      borderRadius: '12px',
+      boxShadow: '0 8px 40px rgba(0,0,0,.35)',
+      padding: '20px 22px',
+      width: 'min(92vw, 380px)',
+      font: '14px/1.4 system-ui,sans-serif',
+    });
+
+    const manualRate = GM_getValue(STORE.cnyRubManual, 0) || '';
+
+    box.innerHTML =
+      '<div style="font:bold 16px/1.2 system-ui;margin-bottom:14px">Настройки переводчика</div>' +
+      '<label style="display:block;margin:10px 0 4px">OpenAI API key <span style="color:#888;font-weight:400">(пусто = Google)</span></label>' +
+      `<input id="tb-s-key" type="password" value="${esc(CFG.apiKey)}" placeholder="sk-..." style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      '<label style="display:block;margin:10px 0 4px">Язык</label>' +
+      `<input id="tb-s-lang" value="${esc(CFG.lang)}" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      '<label style="display:block;margin:10px 0 4px">Движок</label>' +
+      `<select id="tb-s-engine" style="width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      `<option value="auto"${CFG.engine === 'auto' ? ' selected' : ''}>auto (OpenAI если есть ключ)</option>` +
+      `<option value="openai"${CFG.engine === 'openai' ? ' selected' : ''}>OpenAI</option>` +
+      `<option value="google"${CFG.engine === 'google' ? ' selected' : ''}>Google</option>` +
+      '</select>' +
+      '<label style="display:block;margin:10px 0 4px">Курс CNY→RUB <span style="color:#888;font-weight:400">(пусто = авто)</span></label>' +
+      `<input id="tb-s-rate" value="${manualRate ? esc(String(manualRate)) : ''}" placeholder="12.8" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      `<label style="display:flex;align-items:center;gap:8px;margin:12px 0 6px;cursor:pointer"><input id="tb-s-auto" type="checkbox"${CFG.auto ? ' checked' : ''}> Авто-перевод при загрузке</label>` +
+      `<label style="display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer"><input id="tb-s-rub" type="checkbox"${CFG.priceRub ? ' checked' : ''}> Цены в рублях</label>` +
+      '<div style="display:flex;gap:8px;margin-top:16px">' +
+      '<button id="tb-s-save" style="flex:1;padding:10px;border:none;border-radius:8px;background:#ff5000;color:#fff;font:bold 14px system-ui;cursor:pointer">Сохранить</button>' +
+      '<button id="tb-s-close" style="padding:10px 14px;border:1px solid #ccc;border-radius:8px;background:#f5f5f5;cursor:pointer">Закрыть</button>' +
+      '</div>' +
+      '<div id="tb-s-msg" style="margin-top:10px;color:#2a9d4b;font-size:13px;min-height:18px"></div>';
+
+    const backdrop = document.createElement('div');
+    backdrop.id = 'tb-tr-settings-bg';
+    Object.assign(backdrop.style, {
+      position: 'fixed',
+      inset: '0',
+      zIndex: '2147483646',
+      background: 'rgba(0,0,0,.45)',
+    });
+    backdrop.onclick = closeSettings;
+    document.body.append(backdrop, box);
+
+    box.querySelector('#tb-s-close').onclick = closeSettings;
+    box.querySelector('#tb-s-save').onclick = () => {
+      const rate = parseFloat(String(box.querySelector('#tb-s-rate').value || '').replace(',', '.'));
+      saveCfg({
+        apiKey: box.querySelector('#tb-s-key').value.trim(),
+        lang: (box.querySelector('#tb-s-lang').value || 'ru').trim(),
+        engine: box.querySelector('#tb-s-engine').value,
+        auto: box.querySelector('#tb-s-auto').checked,
+        priceRub: box.querySelector('#tb-s-rub').checked,
+      });
+      saveManualRate(rate);
+      syncUI();
+      box.querySelector('#tb-s-msg').textContent = '✓ Сохранено — настройки не сбросятся при обновлении';
+      if (CFG.priceRub) startPriceWatcher();
+      if (CFG.auto) startTranslateWatcher();
+    };
+  }
+
+  function closeSettings() {
+    document.getElementById('tb-tr-settings')?.remove();
+    document.getElementById('tb-tr-settings-bg')?.remove();
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  }
+
+  function syncUI() {
+    const rubBtn = document.getElementById('tb-tr-rub-btn');
+    if (rubBtn) {
+      rubBtn.textContent = CFG.priceRub ? '₽ ✓' : '₽';
+      rubBtn.style.background = CFG.priceRub ? '#2a9d4b' : '#555';
+    }
+  }
+
+  function togglePriceRub() {
+    saveCfg({ priceRub: !CFG.priceRub });
+    syncUI();
+    if (CFG.priceRub) startPriceWatcher();
+  }
 
   const CACHE = new Map();
   let cnyRubRate = null;
@@ -46,34 +198,7 @@
   const BLOCK_SEL =
     'h1,h2,h3,h4,li,tr,td,th,article,section,[class*="title"],[class*="Title"],[class*="desc"],[class*="Desc"],[class*="spec"],[class*="Spec"],[class*="attr"],[class*="sku"],[class*="param"],[class*="review"],[class*="Review"],[class*="item"],[class*="Item"]';
 
-  GM_registerMenuCommand('⚙ Настройки переводчика', openSettings);
-  GM_registerMenuCommand(
-    (CFG.priceRub ? '✓ ' : '✗ ') + 'Цены в рублях',
-    togglePriceRub
-  );
-
-  function togglePriceRub() {
-    GM_setValue('priceRub', !CFG.priceRub);
-    location.reload();
-  }
-
-  function openSettings() {
-    const key = prompt('OpenAI API key (пусто = Google, хуже контекст):', CFG.apiKey) ?? CFG.apiKey;
-    const lang = prompt('Язык (ru, en, uk...):', CFG.lang) ?? CFG.lang;
-    const auto = confirm('Авто-перевод при загрузке?\nOK = да, Отмена = нет');
-    const priceRub = confirm('Конвертировать все цены в рубли?\nOK = да, Отмена = нет');
-    const manualRate = prompt(
-      'Курс CNY→RUB (пусто = авто с API):',
-      GM_getValue('cnyRubManual', '') || ''
-    );
-    GM_setValue('apiKey', key.trim());
-    GM_setValue('lang', (lang || 'ru').trim());
-    GM_setValue('auto', auto);
-    GM_setValue('priceRub', priceRub);
-    const rate = parseFloat(String(manualRate || '').replace(',', '.'));
-    GM_setValue('cnyRubManual', rate > 0 ? rate : 0);
-    location.reload();
-  }
+  GM_registerMenuCommand((CFG.priceRub ? '✓ ' : '') + 'Цены в рублях', togglePriceRub);
 
   function http(opts) {
     return new Promise((resolve, reject) => {
@@ -213,7 +338,8 @@
   }
 
   async function translateUnique(texts, tl, onChunk) {
-    const useAI = CFG.engine === 'openai' || (CFG.engine === 'auto' && CFG.apiKey.length > 10);
+    const useAI =
+      CFG.engine !== 'google' && (CFG.engine === 'openai' || (CFG.engine === 'auto' && CFG.apiKey.length > 10));
     const chunks = chunk(texts, useAI ? AI_CHUNK : GOOGLE_LINES);
 
     const tasks = chunks.map((part) => async () => {
@@ -423,13 +549,13 @@
 
   async function getCnyRubRate() {
     if (cnyRubRate) return cnyRubRate;
-    const manual = +GM_getValue('cnyRubManual', 0);
+    const manual = +GM_getValue(STORE.cnyRubManual, 0);
     if (manual > 0) {
       cnyRubRate = manual;
       return manual;
     }
-    const saved = GM_getValue('cnyRubRate', 0);
-    const savedAt = GM_getValue('cnyRubRateAt', 0);
+    const saved = GM_getValue(STORE.cnyRubRate, 0);
+    const savedAt = GM_getValue(STORE.cnyRubRateAt, 0);
     if (saved > 0 && Date.now() - savedAt < 6 * 3600000) {
       cnyRubRate = saved;
       return saved;
@@ -438,8 +564,8 @@
       const r = await http({ method: 'GET', url: 'https://open.er-api.com/v6/latest/CNY' });
       const rate = JSON.parse(r.responseText).rates?.RUB;
       if (rate > 0) {
-        GM_setValue('cnyRubRate', rate);
-        GM_setValue('cnyRubRateAt', Date.now());
+        GM_setValue(STORE.cnyRubRate, rate);
+        GM_setValue(STORE.cnyRubRateAt, Date.now());
         cnyRubRate = rate;
         return rate;
       }
@@ -621,6 +747,7 @@
     });
 
     const rubBtn = document.createElement('button');
+    rubBtn.id = 'tb-tr-rub-btn';
     rubBtn.textContent = CFG.priceRub ? '₽ ✓' : '₽';
     rubBtn.title = 'Цены в рублях';
     Object.assign(rubBtn.style, {
@@ -633,10 +760,22 @@
       cursor: 'pointer',
       boxShadow: '0 2px 12px rgba(0,0,0,.25)',
     });
-    rubBtn.onclick = () => {
-      GM_setValue('priceRub', !CFG.priceRub);
-      location.reload();
-    };
+    rubBtn.onclick = togglePriceRub;
+
+    const cfgBtn = document.createElement('button');
+    cfgBtn.textContent = '⚙';
+    cfgBtn.title = 'Настройки';
+    Object.assign(cfgBtn.style, {
+      padding: '10px 12px',
+      border: 'none',
+      borderRadius: '8px',
+      background: '#333',
+      color: '#fff',
+      font: 'bold 14px/1 system-ui,sans-serif',
+      cursor: 'pointer',
+      boxShadow: '0 2px 12px rgba(0,0,0,.25)',
+    });
+    cfgBtn.onclick = openSettings;
 
     const status = document.createElement('span');
     status.id = 'tb-tr-status';
@@ -656,7 +795,7 @@
       runTranslate();
     };
 
-    wrap.append(rubBtn, btn, status);
+    wrap.append(cfgBtn, rubBtn, btn, status);
     document.body.appendChild(wrap);
   }
 
