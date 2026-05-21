@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.5.1
+// @version      1.5.2
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @updateURL    https://raw.githubusercontent.com/mrkvka/taobao-ai-translator/main/taobao-ai-translator.user.js
@@ -87,6 +87,34 @@
   function saveManualRate(val) {
     GM_setValue(STORE.cnyRubManual, val > 0 ? val : 0);
     cnyRubRate = null;
+    cnyRubRatePending = null;
+    clearPriceMarks();
+  }
+
+  function clearPriceMarks(root = document.body) {
+    root.querySelectorAll('[data-tb-price],[data-tb-yuan],[data-tb-price-root]').forEach((el) => {
+      delete el.dataset.tbPrice;
+      delete el.dataset.tbYuan;
+      delete el.dataset.tbRate;
+      delete el.dataset.tbPriceRoot;
+    });
+    root.querySelectorAll('[data-tb-price-hide]').forEach((el) => {
+      delete el.dataset.tbPriceHide;
+      el.style.cssText = '';
+    });
+  }
+
+  function rateLabel(rate) {
+    return (Math.round(rate * 100) / 100).toFixed(2).replace(/\.00$/, '');
+  }
+
+  async function refreshRateLabel() {
+    const rate = await getCnyRubRate();
+    const rubBtn = document.getElementById('tb-tr-rub-btn');
+    if (rubBtn && CFG.priceRub) {
+      rubBtn.title = `1 ¥ = ${rateLabel(rate)} ₽ (клик — вкл/выкл)`;
+    }
+    return rate;
   }
 
   GM_registerMenuCommand('⚙ Настройки', openSettings);
@@ -124,8 +152,10 @@
       `<option value="openai"${CFG.engine === 'openai' ? ' selected' : ''}>OpenAI</option>` +
       `<option value="google"${CFG.engine === 'google' ? ' selected' : ''}>Google</option>` +
       '</select>' +
-      '<label style="display:block;margin:10px 0 4px">Курс CNY→RUB <span style="color:#888;font-weight:400">(пусто = авто)</span></label>' +
-      `<input id="tb-s-rate" value="${manualRate ? esc(String(manualRate)) : ''}" placeholder="12.8" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      '<label style="display:block;margin:10px 0 4px">Курс: 1 ¥ = ? ₽</label>' +
+      `<input id="tb-s-rate" value="${manualRate ? esc(String(manualRate)) : ''}" placeholder="авто (~13)" style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ccc;border-radius:6px">` +
+      '<div id="tb-s-rate-live" style="margin:4px 0 8px;color:#666;font-size:12px">Загрузка курса…</div>' +
+      '<div style="color:#888;font-size:12px;margin-bottom:8px">Пример: ¥759 × 13 = 9 867 ₽. Пусто = авто с API.</div>' +
       `<label style="display:flex;align-items:center;gap:8px;margin:12px 0 6px;cursor:pointer"><input id="tb-s-auto" type="checkbox"${CFG.auto ? ' checked' : ''}> Авто-перевод при загрузке</label>` +
       `<label style="display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer"><input id="tb-s-rub" type="checkbox"${CFG.priceRub ? ' checked' : ''}> Цены в рублях</label>` +
       '<div style="display:flex;gap:8px;margin-top:16px">' +
@@ -157,9 +187,19 @@
       });
       saveManualRate(rate);
       syncUI();
-      box.querySelector('#tb-s-msg').textContent = '✓ Сохранено';
-      runInitialPass();
+      box.querySelector('#tb-s-msg').textContent = '✓ Сохранено — цены пересчитаются';
+      refreshRateLabel().then(() => runInitialPass(true));
     };
+
+    getCnyRubRate().then((rate) => {
+      const manual = +GM_getValue(STORE.cnyRubManual, 0);
+      const live = box.querySelector('#tb-s-rate-live');
+      if (live) {
+        live.textContent = manual > 0
+          ? `Сейчас: фиксированный ${rateLabel(manual)} ₽ за 1 ¥`
+          : `Сейчас: авто ${rateLabel(rate)} ₽ за 1 ¥ (обновляется раз в 6 ч)`;
+      }
+    });
   }
 
   function closeSettings() {
@@ -176,13 +216,14 @@
     if (rubBtn) {
       rubBtn.textContent = CFG.priceRub ? '₽ ✓' : '₽';
       rubBtn.style.background = CFG.priceRub ? '#2a9d4b' : '#555';
+      if (CFG.priceRub) refreshRateLabel();
     }
   }
 
   function togglePriceRub() {
     saveCfg({ priceRub: !CFG.priceRub });
     syncUI();
-    if (CFG.priceRub) runPrices();
+    if (CFG.priceRub) runPrices(true);
   }
 
   const OUR_SEL = '#tb-tr-wrap,#tb-tr-settings,#tb-tr-settings-bg';
@@ -213,6 +254,7 @@
 
   const CACHE = new Map();
   let cnyRubRate = null;
+  let cnyRubRatePending = null;
   const CHINESE = /[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/;
   const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'CODE', 'SVG', 'INPUT', 'TEXTAREA']);
   const MIN_LEN = 2;
@@ -559,9 +601,11 @@
     return el.parentElement || el;
   }
 
-  function markPrice(el, orig) {
+  function markPrice(el, orig, cny, rate) {
     el.dataset.tbPrice = '1';
-    el.title = /[¥￥\u00a5\uffe5]/.test(orig) ? orig : '¥' + String(orig).replace(/\s[\s\S]*/, '');
+    el.dataset.tbYuan = String(cny);
+    el.dataset.tbRate = String(rate);
+    el.title = `¥${cny} × ${rateLabel(rate)} = ${formatRub(cny, rate)}`;
   }
 
   function extractCny(text) {
@@ -600,7 +644,11 @@
   }
 
   function applyPriceContainer(el, rate) {
-    if (!el || el.dataset.tbPrice || !isVisible(el) || el.closest('[data-tb-price]') || isOurNode(el)) return false;
+    if (!el || !isVisible(el) || isOurNode(el)) return false;
+    if (el.dataset.tbYuan && el.dataset.tbRate === String(rate)) {
+      hideAllYuanInRow(findPriceRow(el));
+      return false;
+    }
     const done = pauseDom();
     try {
       if (isDigitSplitContainer(el)) {
@@ -615,7 +663,7 @@
       const raw = (el.innerText || el.textContent || '').trim();
       if (!raw) return false;
 
-      if (/₽/.test(raw)) {
+      if (/₽/.test(raw) && el.dataset.tbYuan) {
         if (/[¥￥\u00a5\uffe5]/.test(raw)) {
           el.textContent = raw.replace(/[¥￥\u00a5\uffe5]\s*/g, '').trim();
         }
@@ -623,20 +671,22 @@
         return true;
       }
 
-      if (isPurePriceText(raw)) {
-        const cny = extractCny(raw);
-        if (cny > 0 && cny < 10000000) {
-          replacePriceContainer(el, cny, raw, rate);
-          return true;
-        }
+      let cny = extractCny(raw.replace(/₽/g, ''));
+      if (cny > 0 && cny < 10000000 && (/[¥￥\u00a5\uffe5元]/.test(raw) || isPurePriceText(raw) || isLikelyPriceEl(el) || /₽/.test(raw))) {
+        replacePriceContainer(el, cny, raw, rate);
+        return true;
       }
 
       if (/[¥￥\u00a5\uffe5]|元/.test(raw)) {
         const next = convertAnyPrice(raw, rate, el);
         if (next && next !== raw) {
-          markPrice(el, raw);
-          el.textContent = next;
-          hideAllYuanInRow(findPriceRow(el));
+          const num = extractCny(raw);
+          if (num) replacePriceContainer(el, num, raw, rate);
+          else {
+            markPrice(el, raw, extractCny(raw) || 0, rate);
+            el.textContent = next;
+            hideAllYuanInRow(findPriceRow(el));
+          }
           return true;
         }
       }
@@ -652,12 +702,12 @@
     const rub = formatRub(cny, rate);
     hideAllYuanInRow(row);
     const rowText = (row.innerText || '').replace(/\s+/g, ' ').trim();
-    const extra = rowText.replace(/^[¥￥\u00a5\uffe5\d\s.,]+/i, '').replace(/[\d\s.,]+ ₽/i, '').trim();
+    const extra = rowText.replace(/^[¥￥\u00a5\uffe5\d\s.,₽]+/i, '').trim();
     if (!extra || extra.length <= 4) {
-      markPrice(row, orig);
+      markPrice(row, orig, cny, rate);
       row.textContent = rub;
     } else {
-      markPrice(el, orig);
+      markPrice(el, orig, cny, rate);
       el.textContent = rub;
     }
     hideAllYuanInRow(row);
@@ -688,8 +738,17 @@
     } catch (e) {
       console.warn('[Taobao TR] rate fetch failed', e);
     }
-    cnyRubRate = 12.8;
+    cnyRubRate = 13;
     return cnyRubRate;
+  }
+
+  function getCnyRubRateSync() {
+    const manual = +GM_getValue(STORE.cnyRubManual, 0);
+    if (manual > 0) return manual;
+    if (cnyRubRate) return cnyRubRate;
+    const saved = GM_getValue(STORE.cnyRubRate, 0);
+    if (saved > 0) return saved;
+    return 13;
   }
 
   function convertAnyPrice(text, rate, el) {
@@ -719,19 +778,21 @@
     return formatRub(cny, rate) + m[2];
   }
 
-  function collectPriceContainers(root = document.body) {
+  function collectPriceContainers(root = document.body, rate) {
     const set = new Set();
     root.querySelectorAll(PRICE_QUERY).forEach((el) => {
       if (isOurNode(el)) return;
+      if (el.dataset.tbYuan && el.dataset.tbRate === String(rate)) return;
       set.add(el);
       if (isDigitSplitContainer(el) || isPurePriceText((el.innerText || '').trim())) set.add(el);
       el.querySelectorAll('span, em, b, i').forEach((c) => {
+        if (c.dataset.tbYuan && c.dataset.tbRate === String(rate)) return;
         const t = (c.textContent || '').trim();
-        if (isDigitSplitContainer(c) || isPurePriceText(t) || (/^[¥￥\u00a5\uffe5]?\s*\d/.test(t) && !/₽/.test(t)))
+        if (isDigitSplitContainer(c) || isPurePriceText(t) || (/^[¥￥\u00a5\uffe5]?\s*\d/.test(t) && !c.dataset.tbYuan))
           set.add(c);
       });
     });
-    return [...set].filter((el) => isVisible(el) && !el.closest('[data-tb-price]'));
+    return [...set].filter((el) => isVisible(el));
   }
 
   function scrubYuanLeftovers(root = document.body) {
@@ -777,16 +838,18 @@
     });
   }
 
-  async function runPrices(root = document.body) {
+  async function runPrices(force = false, root = document.body) {
     if (!CFG.priceRub || priceBusy) return;
+    if (force) clearPriceMarks(root);
     priceBusy = true;
     const done = pauseDom();
     try {
       ensurePriceCss();
       fixBrokenRubPrices(root);
       const rate = await getCnyRubRate();
-      for (const el of collectPriceContainers(root)) applyPriceContainer(el, rate);
+      for (const el of collectPriceContainers(root, rate)) applyPriceContainer(el, rate);
       scrubYuanLeftovers(root);
+      refreshRateLabel();
     } finally {
       done();
       priceBusy = false;
@@ -834,7 +897,7 @@
       });
 
       if (id === runId && status) status.textContent = '✓';
-      if (CFG.priceRub) await runPrices(root);
+      if (CFG.priceRub) await runPrices(false, root);
     } catch (e) {
       console.error('[Taobao TR]', e);
       const st = document.getElementById('tb-tr-status');
@@ -916,7 +979,8 @@
     btn.onclick = () => {
       CACHE.clear();
       runId++;
-      if (CFG.priceRub) runPrices();
+      clearPriceMarks();
+      if (CFG.priceRub) runPrices(true);
       runTranslate();
     };
 
@@ -934,12 +998,13 @@
     }, SCAN_DEBOUNCE);
   }
 
-  function runInitialPass() {
-    if (CFG.priceRub) runPrices();
+  function runInitialPass(forcePrices = false) {
+    if (forcePrices) clearPriceMarks();
+    if (CFG.priceRub) runPrices(forcePrices);
     if (CFG.auto) runTranslate();
     LOAD_RETRIES.forEach((ms) =>
       setTimeout(() => {
-        if (CFG.priceRub) runPrices();
+        if (CFG.priceRub) runPrices(false);
         if (CFG.auto) runTranslate();
       }, ms)
     );
@@ -949,8 +1014,12 @@
   function boot() {
     if (booted || !document.body) return;
     booted = true;
+    if (!GM_getValue('tbtr.rateFix152', false)) {
+      clearPriceMarks();
+      GM_setValue('tbtr.rateFix152', true);
+    }
     makeUI();
-    runInitialPass();
+    runInitialPass(true);
 
     const obs = new MutationObserver((mutations) => {
       if (pauseMut > 0) return;
