@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.3.1
+// @version      1.3.2
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
 // @match        https://*.taobao.com/*
@@ -292,16 +292,14 @@
     document.head.appendChild(st);
   }
 
-  function hideYuanSymbol(el) {
-    const root = el.closest('[class*="Price"], [class*="price"]') || el.parentElement;
+  function hideYuanSymbol(root) {
     if (!root) return;
     root.dataset.tbPriceRoot = '1';
     root.querySelectorAll('span, em, i, b, div').forEach((s) => {
-      if (s === el || s.dataset.tbPrice) return;
+      if (s.dataset.tbPriceHide) return;
       const t = (s.textContent || '').trim();
-      if (!t || /^\d/.test(t)) return;
-      if (/^[¥￥\u00a5\uffe5]$/.test(t) || /^\.?\d{0,2}$/.test(t) || /元/.test(t)) {
-        s.style.cssText = 'display:none!important;font-size:0!important;width:0!important;overflow:hidden!important';
+      if (!t || /₽/.test(t)) return;
+      if (/^[¥￥\u00a5\uffe5]$/.test(t) || /元/.test(t)) {
         s.dataset.tbPriceHide = '1';
       }
     });
@@ -309,7 +307,84 @@
 
   function markPrice(el, orig) {
     el.dataset.tbPrice = '1';
-    el.title = /[¥￥\u00a5\uffe5]/.test(orig) ? orig : '¥' + orig.replace(/\s[\s\S]*/, '');
+    el.title = /[¥￥\u00a5\uffe5]/.test(orig) ? orig : '¥' + String(orig).replace(/\s[\s\S]*/, '');
+  }
+
+  function extractCny(text) {
+    const m = String(text)
+      .replace(/\s+/g, '')
+      .match(/(?:[¥￥\u00a5\uffe5])?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
+    return m ? parseCnyNum(m[1]) : null;
+  }
+
+  function isPurePriceText(text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    if (!t || /₽/.test(t)) return false;
+    const rest = t.replace(/[¥￥\u00a5\uffe5元,\s\d.]/g, '');
+    return rest.length === 0 && extractCny(t) > 0;
+  }
+
+  function getDigitLeaves(el) {
+    return [...el.querySelectorAll('span, em, b, i, div')].filter(
+      (c) => isVisible(c) && c.children.length === 0 && /^[\d.]+$/.test((c.textContent || '').trim())
+    );
+  }
+
+  function isDigitSplitContainer(el) {
+    if (!el || el.dataset.tbPrice || el.children.length < 2) return false;
+    const leaves = getDigitLeaves(el);
+    if (leaves.length < 2 || leaves.length > 6) return false;
+    const cny = extractCny(el.innerText);
+    if (!cny || cny <= 0) return false;
+    const extra = (el.innerText || '').replace(/[\d.,\s¥￥\u00a5\uffe5元]/g, '').trim();
+    return extra.length <= 4;
+  }
+
+  function combineSplitDigits(el) {
+    const cny = extractCny(el.innerText);
+    return cny ? String(cny) : null;
+  }
+
+  function replacePriceContainer(el, cny, orig, rate) {
+    markPrice(el, orig);
+    el.textContent = formatRub(cny, rate);
+    hideYuanSymbol(el);
+  }
+
+  function applyPriceContainer(el, rate) {
+    if (!el || el.dataset.tbPrice || !isVisible(el) || el.closest('[data-tb-price]')) return false;
+
+    if (isDigitSplitContainer(el)) {
+      const combined = combineSplitDigits(el);
+      const cny = parseCnyNum(combined);
+      if (cny > 0 && cny < 10000000) {
+        replacePriceContainer(el, cny, combined, rate);
+        return true;
+      }
+    }
+
+    const raw = (el.innerText || el.textContent || '').trim();
+    if (!raw || /₽/.test(raw)) return false;
+
+    if (isPurePriceText(raw)) {
+      const cny = extractCny(raw);
+      if (cny > 0 && cny < 10000000) {
+        replacePriceContainer(el, cny, raw, rate);
+        return true;
+      }
+    }
+
+    if (/[¥￥\u00a5\uffe5]|元/.test(raw)) {
+      const next = convertAnyPrice(raw, rate, el);
+      if (next && next !== raw) {
+        markPrice(el, raw);
+        el.textContent = next;
+        hideYuanSymbol(el);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   async function getCnyRubRate() {
@@ -368,93 +443,48 @@
     return formatRub(cny, rate) + m[2];
   }
 
-  function applyPriceLeaf(el, rate) {
-    if (!el || el.dataset.tbPrice || !isVisible(el)) return false;
-    if (el.children.length > 0) return false;
-    const raw = (el.textContent || '').trim();
-    if (!raw || raw.length > 60 || /₽/.test(raw)) return false;
-    const next = convertAnyPrice(raw, rate, el);
-    if (!next || next === raw) return false;
-    markPrice(el, raw);
-    el.textContent = next;
-    hideYuanSymbol(el);
-    return true;
-  }
-
-  function applyPriceElement(el, rate) {
-    if (!el || el.dataset.tbPrice || !isVisible(el)) return false;
-    const raw = (el.innerText || el.textContent || '').trim();
-    if (!raw || raw.length > 80 || /₽/.test(raw)) return false;
-
-    if (el.children.length === 0) return applyPriceLeaf(el, rate);
-
-    if (el.children.length <= 3 && isLikelyPriceEl(el)) {
-      let changed = false;
+  function collectPriceContainers() {
+    const set = new Set();
+    document.querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]').forEach((el) => {
+      set.add(el);
       el.querySelectorAll('span, em, b, i, strong, div').forEach((c) => {
-        if (applyPriceLeaf(c, rate)) changed = true;
+        if (isDigitSplitContainer(c) || isPurePriceText((c.innerText || c.textContent || '').trim())) set.add(c);
       });
-      if (changed) {
-        hideYuanSymbol(el);
-        el.dataset.tbPrice = '1';
-        return true;
-      }
-    }
-
-    const next = convertAnyPrice(raw, rate, el);
-    if (!next || next === raw) return false;
-    markPrice(el, raw);
-    el.textContent = next;
-    hideYuanSymbol(el);
-    return true;
-  }
-
-  function collectPriceNodes(root = document.body) {
-    const nodes = [];
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(n) {
-        const p = n.parentElement;
-        if (!p || SKIP.has(p.tagName) || p.closest('[data-tb-price]')) return NodeFilter.FILTER_REJECT;
-        if (p.isContentEditable || p.hidden) return NodeFilter.FILTER_REJECT;
-        const t = n.textContent;
-        if (!t || !t.trim() || /₽/.test(t)) return NodeFilter.FILTER_REJECT;
-        if (!isVisible(p)) return NodeFilter.FILTER_REJECT;
-        if (/[¥￥\u00a5\uffe5]|元|CN¥/.test(t)) return NodeFilter.FILTER_ACCEPT;
-        if (isLikelyPriceEl(p) && /^\s*\d[\d,.\s]*/.test(t)) return NodeFilter.FILTER_ACCEPT;
-        return NodeFilter.FILTER_REJECT;
-      },
     });
-    let n;
-    while ((n = walker.nextNode())) nodes.push(n);
-    return nodes;
+    document.querySelectorAll('span, em, b, strong, div').forEach((el) => {
+      if (isDigitSplitContainer(el)) set.add(el);
+      else if (el.children.length === 0 && isLikelyPriceEl(el) && isPurePriceText(el.textContent)) set.add(el);
+    });
+    return [...set]
+      .filter((el) => isVisible(el) && !el.closest('[data-tb-price]'))
+      .sort((a, b) => (a.innerText?.length || 0) - (b.innerText?.length || 0));
   }
 
-  function applyPriceTextNode(node, rate) {
-    const raw = node.textContent;
-    const el = node.parentElement;
-    const next = convertAnyPrice(raw.trim(), rate, el);
-    if (!next || next === raw.trim()) return false;
-    markPrice(el, raw.trim());
-    node.textContent = raw.replace(raw.trim(), next);
-    hideYuanSymbol(el);
-    return true;
+  function fixBrokenRubPrices() {
+    document.querySelectorAll('span, em, b, i, strong, div').forEach((el) => {
+      if (el.children.length > 0) return;
+      const t = (el.textContent || '').trim();
+      const m = t.match(/^([\d\s.,]+ ₽)(\d)$/);
+      if (m) {
+        el.textContent = m[1];
+        el.dataset.tbPrice = '1';
+      }
+    });
   }
 
   async function runPrices() {
     if (!CFG.priceRub) return;
     ensurePriceCss();
+    fixBrokenRubPrices();
     const rate = await getCnyRubRate();
 
     document
-      .querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"]')
-      .forEach((el) => applyPriceElement(el, rate));
+      .querySelectorAll('[class*="Price"], [class*="price"], [class*="RMB"], [class*="rmb"], span, em, b, strong, div')
+      .forEach((el) => {
+        if (isDigitSplitContainer(el)) applyPriceContainer(el, rate);
+      });
 
-    for (const node of collectPriceNodes()) applyPriceTextNode(node, rate);
-
-    document.querySelectorAll('span, em, b, i, strong, div, p').forEach((el) => {
-      if (el.children.length > 0 || el.dataset.tbPrice) return;
-      if (!isLikelyPriceEl(el)) return;
-      applyPriceLeaf(el, rate);
-    });
+    for (const el of collectPriceContainers()) applyPriceContainer(el, rate);
   }
 
   function startPriceWatcher() {
