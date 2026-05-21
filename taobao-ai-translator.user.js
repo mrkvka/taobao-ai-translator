@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Taobao AI Translator (RU)
 // @namespace    https://github.com/mrkvka/taobao-ai-translator
-// @version      1.4.1
+// @version      1.4.2
 // @description  Контекстный перевод Taobao/Tmall (товар, характеристики, отзывы)
 // @author       cursor
+// @updateURL    https://raw.githubusercontent.com/mrkvka/taobao-ai-translator/main/taobao-ai-translator.user.js
+// @downloadURL  https://raw.githubusercontent.com/mrkvka/taobao-ai-translator/main/taobao-ai-translator.user.js
 // @match        https://*.taobao.com/*
 // @match        https://*.tmall.com/*
 // @match        https://taobao.com/*
